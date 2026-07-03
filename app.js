@@ -13,11 +13,23 @@ const { Queue } = require("bullmq");
 const fastify = require("fastify")({ logger: true });
 const bullBoardQueues = [];
 
-const bullBoardPath = normalizePath(process.env.BULL_BOARD_PATH || "/admin/queues");
+const bullBoardPath = normalizeBullBoardPath(
+  process.env.BULL_BOARD_PATH || "/admin/queues"
+);
 const bullBoardUsername =
   process.env.BULL_BOARD_USERNAME || process.env.ADMIN_USERNAME;
 const bullBoardPassword =
   process.env.BULL_BOARD_PASSWORD || process.env.ADMIN_PASSWORD;
+const notifyToken = process.env.FEISHU_NOTIFY_TOKEN || process.env.NOTIFY_TOKEN;
+const feishuWebhookAllowedHosts = parseList(
+  process.env.FEISHU_WEBHOOK_ALLOWED_HOSTS ||
+    "open.feishu.cn,open.larksuite.com"
+).map((host) => host.toLowerCase());
+
+if (notifyToken && notifyToken.length < 16) {
+  throw new Error("FEISHU_NOTIFY_TOKEN must be at least 16 characters.");
+}
+
 const oidcConfig = getOidcConfig();
 const bullBoardAuthMode = getBullBoardAuthMode(oidcConfig);
 
@@ -28,7 +40,14 @@ setupBullBoard();
 
 // Declare a route
 fastify.post("/notify/feishu", async (request, reply) => {
-  const link = `https://${request.query.link}`;
+  if (!isAuthorizedNotifyRequest(request)) {
+    return reply.code(401).send("Authentication required.");
+  }
+
+  const link = getFeishuWebhookUrl(request.query.link);
+  if (!link) {
+    return reply.code(400).send("Invalid Feishu webhook URL.");
+  }
 
   const { jobQueue, jobId, status, result, error, cost, startAt, payload } =
     request.body;
@@ -180,6 +199,7 @@ function setupOidcAuth(config) {
       userinfo = await this.bullBoardOidc.userinfo(tokenResponse.token);
     } catch (err) {
       request.log.warn({ err }, "OIDC login failed");
+      clearOidcFlowCookies(reply, config);
       return reply.code(401).send("OIDC login failed.");
     }
 
@@ -191,6 +211,7 @@ function setupOidcAuth(config) {
         },
         "OIDC user is not allowed"
       );
+      clearOidcFlowCookies(reply, config);
       return reply.code(403).send("OIDC user is not allowed.");
     }
 
@@ -227,6 +248,13 @@ function getOidcConfig() {
   const issuer = process.env.OIDC_ISSUER;
   const clientId = process.env.OIDC_CLIENT_ID;
   const clientSecret = process.env.OIDC_CLIENT_SECRET;
+  const allowedEmails = parseList(process.env.OIDC_ALLOWED_EMAILS).map((email) =>
+    email.toLowerCase()
+  );
+  const allowedDomains = parseList(process.env.OIDC_ALLOWED_DOMAINS).map(
+    (domain) => domain.toLowerCase()
+  );
+  const allowAllUsers = parseBoolean(process.env.OIDC_ALLOW_ALL_USERS, false);
   const sessionSecret =
     process.env.OIDC_SESSION_SECRET || process.env.COOKIE_SECRET;
   const configuredValues = [
@@ -244,6 +272,30 @@ function getOidcConfig() {
     throw new Error(
       "OIDC is partially configured. Set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_SESSION_SECRET."
     );
+  }
+
+  if (hasRequiredConfig && sessionSecret.length < 32) {
+    throw new Error("OIDC_SESSION_SECRET must be at least 32 characters.");
+  }
+
+  if (
+    hasRequiredConfig &&
+    !allowAllUsers &&
+    !allowedEmails.length &&
+    !allowedDomains.length
+  ) {
+    throw new Error(
+      "OIDC requires OIDC_ALLOWED_EMAILS, OIDC_ALLOWED_DOMAINS, or OIDC_ALLOW_ALL_USERS=true."
+    );
+  }
+
+  if (
+    hasRequiredConfig &&
+    process.env.NODE_ENV === "production" &&
+    !process.env.OIDC_BASE_URL &&
+    !process.env.OIDC_CALLBACK_URL
+  ) {
+    throw new Error("OIDC_BASE_URL or OIDC_CALLBACK_URL is required in production.");
   }
 
   return {
@@ -264,11 +316,12 @@ function getOidcConfig() {
       process.env.OIDC_LOGOUT_PATH || `${bullBoardPath}/logout`
     ),
     scopes: parseList(process.env.OIDC_SCOPES || "openid,profile,email"),
-    allowedEmails: parseList(process.env.OIDC_ALLOWED_EMAILS).map((email) =>
-      email.toLowerCase()
-    ),
-    allowedDomains: parseList(process.env.OIDC_ALLOWED_DOMAINS).map((domain) =>
-      domain.toLowerCase()
+    allowedEmails,
+    allowedDomains,
+    allowAllUsers,
+    requireEmailVerified: parseBoolean(
+      process.env.OIDC_REQUIRE_EMAIL_VERIFIED,
+      true
     ),
     emailClaim: process.env.OIDC_EMAIL_CLAIM || "email",
     nameClaim: process.env.OIDC_NAME_CLAIM || "name",
@@ -307,6 +360,10 @@ function getOidcCallbackUrl(request, config) {
 
   if (config.baseUrl) {
     return `${config.baseUrl.replace(/\/+$/, "")}${config.callbackPath}`;
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("OIDC_BASE_URL or OIDC_CALLBACK_URL is required in production.");
   }
 
   return `${getRequestOrigin(request)}${config.callbackPath}`;
@@ -353,6 +410,14 @@ function parsePositiveInteger(value, fallback) {
   return Number.isInteger(parsedValue) && parsedValue > 0
     ? parsedValue
     : fallback;
+}
+
+function parseBoolean(value, fallback) {
+  if (value === undefined) {
+    return fallback;
+  }
+
+  return value.toLowerCase() === "true";
 }
 
 function isOidcAuthRoute(request, config) {
@@ -443,12 +508,16 @@ function getOidcSessionCookieOptions(config) {
 }
 
 function isOidcUserAllowed(userinfo, config) {
-  if (!config.allowedEmails.length && !config.allowedDomains.length) {
+  if (config.allowAllUsers) {
     return true;
   }
 
   const email = getClaim(userinfo, config.emailClaim);
   if (!email) {
+    return false;
+  }
+
+  if (config.requireEmailVerified && userinfo.email_verified !== true) {
     return false;
   }
 
@@ -470,6 +539,15 @@ function getClaim(userinfo, claimName) {
 function normalizePath(path) {
   const normalized = path.startsWith("/") ? path : `/${path}`;
   return normalized.replace(/\/+$/, "") || "/";
+}
+
+function normalizeBullBoardPath(path) {
+  const normalizedPath = normalizePath(path);
+  if (normalizedPath === "/") {
+    throw new Error("BULL_BOARD_PATH must not be '/'. Use a sub-path such as /admin/queues.");
+  }
+
+  return normalizedPath;
 }
 
 function parseList(value) {
@@ -524,6 +602,49 @@ function isBullBoardRequest(request) {
 
 function getRequestPathname(request) {
   return new URL(request.url, "http://localhost").pathname;
+}
+
+function isAuthorizedNotifyRequest(request) {
+  if (!notifyToken) {
+    return false;
+  }
+
+  const authorization = request.headers.authorization || "";
+  const bearerToken = authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : undefined;
+  const requestToken =
+    request.headers["x-notify-token"] || request.query.token || bearerToken;
+
+  return (
+    typeof requestToken === "string" && safeEqual(requestToken, notifyToken)
+  );
+}
+
+function getFeishuWebhookUrl(link) {
+  if (typeof link !== "string" || !link) {
+    return null;
+  }
+
+  let parsedUrl;
+  const normalizedLink = /^https?:\/\//i.test(link) ? link : `https://${link}`;
+
+  try {
+    parsedUrl = new URL(normalizedLink);
+  } catch (_err) {
+    return null;
+  }
+
+  if (
+    parsedUrl.protocol !== "https:" ||
+    parsedUrl.username ||
+    parsedUrl.password ||
+    !feishuWebhookAllowedHosts.includes(parsedUrl.hostname.toLowerCase())
+  ) {
+    return null;
+  }
+
+  return parsedUrl.toString();
 }
 
 function parseBasicAuth(authorization) {
