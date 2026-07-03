@@ -43,7 +43,7 @@ fastify.post("/notify/feishu", async (request, reply) => {
 // Run the server!
 const start = async () => {
   try {
-    await fastify.listen(process.env.PORT || 8001);
+    await fastify.listen({ port: Number(process.env.PORT || 8001) });
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
