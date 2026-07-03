@@ -3,7 +3,7 @@
 这个服务做两件事：
 
 - 接收导出任务回调，并转发通知到飞书机器人。
-- 提供 BullMQ 队列管理页，基于 bull-board，支持 Basic Auth 或 OIDC 登录。
+- 提供 BullMQ 队列管理页，基于 bull-board，支持 JWT 密码登录或 OIDC 登录。
 
 ## 安装与启动
 
@@ -16,19 +16,7 @@ pnpm start
 
 ## 必填安全配置
 
-通知接口必须配置访问 token：
-
-```env
-FEISHU_NOTIFY_TOKEN=replace-with-random-token
-```
-
-`FEISHU_NOTIFY_TOKEN` 至少 16 个字符。请求 `/notify/feishu` 时可任选一种方式传入：
-
-```http
-x-notify-token: <FEISHU_NOTIFY_TOKEN>
-Authorization: Bearer <FEISHU_NOTIFY_TOKEN>
-?token=<FEISHU_NOTIFY_TOKEN>
-```
+通知接口不校验请求方身份。
 
 飞书 webhook 域名默认只允许：
 
@@ -92,22 +80,36 @@ REDIS_URL=redis://127.0.0.1:6379/0
 BULL_BOARD_QUEUES=export-jobs,mail-jobs,report-jobs
 ```
 
-## Basic Auth 模式
+## JWT 密码登录模式
 
-适合内网或临时部署：
+适合内网或临时部署。访问 `/admin/queues` 时会先跳转到登录页，登录成功后写入 7 天有效期的 HttpOnly JWT cookie。
 
 ```env
-BULL_BOARD_AUTH=basic
+BULL_BOARD_AUTH=jwt
 BULL_BOARD_USERNAME=admin
 BULL_BOARD_PASSWORD=replace-with-strong-password
+BULL_BOARD_JWT_SECRET=replace-with-at-least-32-random-characters
+BULL_BOARD_JWT_MAX_AGE_SECONDS=604800
 ```
 
-访问 `/admin/queues` 时浏览器会弹出账号密码登录框。
+默认登录地址：
+
+```text
+/admin/queues/login
+```
+
+默认退出地址：
+
+```text
+/admin/queues/logout
+```
+
+历史配置 `BULL_BOARD_AUTH=basic` 会按 JWT 密码登录模式处理。
 
 ## OIDC 模式
 
-启用 OIDC 后，`BULL_BOARD_USERNAME` 和 `BULL_BOARD_PASSWORD` 会被忽略。
-如果使用 Basic Auth，保持 `.env.example` 中的 OIDC 变量为注释状态即可。
+启用 OIDC 后，`BULL_BOARD_USERNAME`、`BULL_BOARD_PASSWORD` 和 `BULL_BOARD_JWT_SECRET` 会被忽略。
+如果使用 JWT 密码登录，保持 `.env.example` 中的 OIDC 变量为注释状态即可。
 
 ```env
 BULL_BOARD_AUTH=oidc
@@ -166,11 +168,14 @@ OIDC_REQUIRE_EMAIL_VERIFIED=false
 | 变量 | 说明 |
 | --- | --- |
 | `PORT` | 服务监听端口，默认 `8001` |
-| `FEISHU_NOTIFY_TOKEN` | 通知接口访问 token，至少 16 字符 |
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | 允许转发的飞书 webhook 域名 |
-| `BULL_BOARD_AUTH` | 管理页认证模式：`basic` 或 `oidc` |
+| `BULL_BOARD_AUTH` | 管理页认证模式：`jwt` 或 `oidc`，`basic` 为兼容别名 |
 | `BULL_BOARD_PATH` | 管理页路径，不能是 `/` |
 | `BULL_BOARD_QUEUES` | BullMQ 队列名，逗号分隔 |
+| `BULL_BOARD_USERNAME` | JWT 密码登录用户名 |
+| `BULL_BOARD_PASSWORD` | JWT 密码登录密码 |
+| `BULL_BOARD_JWT_SECRET` | JWT 签名密钥，至少 32 字符 |
+| `BULL_BOARD_JWT_MAX_AGE_SECONDS` | JWT cookie 有效期，默认 7 天 |
 | `REDIS_URL` | Redis 连接串 |
 | `OIDC_ISSUER` | OIDC issuer URL |
 | `OIDC_CLIENT_ID` | OIDC client id |
@@ -193,7 +198,7 @@ pnpm outdated --format json
 确认：
 
 - `.env` 没有提交到 Git。
-- `FEISHU_NOTIFY_TOKEN` 已设置且足够长。
 - `BULL_BOARD_PATH` 不是 `/`。
+- JWT 密码登录模式下已配置强密码和 `BULL_BOARD_JWT_SECRET`。
 - OIDC 模式下已配置用户白名单或显式 `OIDC_ALLOW_ALL_USERS=true`。
 - 生产环境 OIDC 已配置 `OIDC_BASE_URL` 或 `OIDC_CALLBACK_URL`。

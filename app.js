@@ -1,7 +1,7 @@
 require("dotenv").config({ quiet: true });
 
 const axios = require("axios");
-const { timingSafeEqual } = require("crypto");
+const { createHmac, timingSafeEqual } = require("crypto");
 const { basename } = require("path");
 const { createBullBoard } = require("@bull-board/api");
 const { BullMQAdapter } = require("@bull-board/api/bullMQAdapter");
@@ -20,19 +20,18 @@ const bullBoardUsername =
   process.env.BULL_BOARD_USERNAME || process.env.ADMIN_USERNAME;
 const bullBoardPassword =
   process.env.BULL_BOARD_PASSWORD || process.env.ADMIN_PASSWORD;
-const notifyToken = process.env.FEISHU_NOTIFY_TOKEN || process.env.NOTIFY_TOKEN;
 const feishuWebhookAllowedHosts = parseList(
   process.env.FEISHU_WEBHOOK_ALLOWED_HOSTS ||
     "open.feishu.cn,open.larksuite.com"
 ).map((host) => host.toLowerCase());
 
-if (notifyToken && notifyToken.length < 16) {
-  throw new Error("FEISHU_NOTIFY_TOKEN must be at least 16 characters.");
-}
-
 const bullBoardAuthMode = getBullBoardAuthMode();
+const jwtAuthConfig = getJwtAuthConfig(bullBoardAuthMode);
 const oidcConfig = getOidcConfig(bullBoardAuthMode);
 
+if (bullBoardAuthMode === "jwt") {
+  setupJwtAuth(jwtAuthConfig);
+}
 if (bullBoardAuthMode === "oidc") {
   setupOidcAuth(oidcConfig);
 }
@@ -40,10 +39,6 @@ setupBullBoard();
 
 // Declare a route
 fastify.post("/notify/feishu", async (request, reply) => {
-  if (!isAuthorizedNotifyRequest(request)) {
-    return reply.code(401).send("Authentication required.");
-  }
-
   const link = getFeishuWebhookUrl(request.query.link);
   if (!link) {
     return reply.code(400).send("Invalid Feishu webhook URL.");
@@ -132,25 +127,59 @@ function setupBullBoard() {
       return authenticateWithOidc(request, reply, oidcConfig);
     }
 
-    if (!bullBoardUsername || !bullBoardPassword) {
-      return reply.code(503).send("Bull Board auth is not configured.");
-    }
-
-    const credentials = parseBasicAuth(request.headers.authorization);
-    const isAuthorized =
-      credentials &&
-      safeEqual(credentials.username, bullBoardUsername) &&
-      safeEqual(credentials.password, bullBoardPassword);
-
-    if (!isAuthorized) {
-      return reply
-        .header("WWW-Authenticate", 'Basic realm="Bull Board"')
-        .code(401)
-        .send("Authentication required.");
-    }
+    return authenticateWithJwt(request, reply, jwtAuthConfig);
   });
 
   fastify.register(serverAdapter.registerPlugin(), { prefix: bullBoardPath });
+}
+
+function setupJwtAuth(config) {
+  fastify.register(fastifyCookie);
+
+  fastify.addContentTypeParser(
+    "application/x-www-form-urlencoded",
+    { parseAs: "string" },
+    (_request, body, done) => {
+      try {
+        done(null, Object.fromEntries(new URLSearchParams(body)));
+      } catch (err) {
+        done(err);
+      }
+    }
+  );
+
+  fastify.get(config.loginPath, async (request, reply) => {
+    if (getJwtSession(request, config)) {
+      return reply.redirect(bullBoardPath);
+    }
+
+    return reply
+      .type("text/html; charset=utf-8")
+      .send(renderJwtLoginPage(config));
+  });
+
+  fastify.post(config.loginPath, async (request, reply) => {
+    const credentials = getLoginCredentials(request.body);
+    if (!areJwtCredentialsValid(credentials, config)) {
+      return reply
+        .code(401)
+        .type("text/html; charset=utf-8")
+        .send(
+          renderJwtLoginPage(config, {
+            error: true,
+            username: credentials?.username,
+          })
+        );
+    }
+
+    setJwtSessionCookie(reply, config);
+    return reply.redirect(bullBoardPath);
+  });
+
+  fastify.get(config.logoutPath, async (_request, reply) => {
+    clearJwtSessionCookie(reply, config);
+    return reply.redirect(config.loginPath);
+  });
 }
 
 function setupOidcAuth(config) {
@@ -226,6 +255,24 @@ function setupOidcAuth(config) {
   });
 }
 
+function authenticateWithJwt(request, reply, config) {
+  if (isJwtAuthRoute(request, config)) {
+    return;
+  }
+
+  const session = getJwtSession(request, config);
+  if (session) {
+    request.jwtSession = session;
+    return;
+  }
+
+  if (shouldRedirectToJwtLogin(request)) {
+    return reply.redirect(config.loginPath);
+  }
+
+  return reply.code(401).send("Authentication required.");
+}
+
 function authenticateWithOidc(request, reply, config) {
   if (isOidcAuthRoute(request, config)) {
     return;
@@ -242,6 +289,61 @@ function authenticateWithOidc(request, reply, config) {
   }
 
   return reply.code(401).send("Authentication required.");
+}
+
+function getJwtAuthConfig(authMode) {
+  if (authMode !== "jwt") {
+    return {
+      enabled: false,
+    };
+  }
+
+  const secret =
+    process.env.BULL_BOARD_JWT_SECRET ||
+    process.env.JWT_SECRET ||
+    process.env.COOKIE_SECRET;
+
+  if (!bullBoardUsername || !bullBoardPassword) {
+    throw new Error(
+      "BULL_BOARD_AUTH=jwt requires BULL_BOARD_USERNAME and BULL_BOARD_PASSWORD."
+    );
+  }
+
+  if (!secret) {
+    throw new Error(
+      "BULL_BOARD_AUTH=jwt requires BULL_BOARD_JWT_SECRET or COOKIE_SECRET."
+    );
+  }
+
+  if (secret.length < 32) {
+    throw new Error("BULL_BOARD_JWT_SECRET must be at least 32 characters.");
+  }
+
+  return {
+    enabled: true,
+    username: bullBoardUsername,
+    password: bullBoardPassword,
+    secret,
+    loginPath: normalizePath(
+      process.env.BULL_BOARD_LOGIN_PATH || `${bullBoardPath}/login`
+    ),
+    logoutPath: normalizePath(
+      process.env.BULL_BOARD_LOGOUT_PATH || `${bullBoardPath}/logout`
+    ),
+    cookieName: process.env.BULL_BOARD_JWT_COOKIE_NAME || "bull_board_jwt",
+    cookieSecure: parseCookieSecure(
+      process.env.BULL_BOARD_JWT_COOKIE_SECURE ||
+        process.env.BULL_BOARD_COOKIE_SECURE
+    ),
+    cookieSameSite:
+      process.env.BULL_BOARD_JWT_COOKIE_SAME_SITE ||
+      process.env.BULL_BOARD_COOKIE_SAME_SITE ||
+      "lax",
+    sessionMaxAgeSeconds: parsePositiveInteger(
+      process.env.BULL_BOARD_JWT_MAX_AGE_SECONDS,
+      604800
+    ),
+  };
 }
 
 function getOidcConfig(authMode) {
@@ -341,7 +443,7 @@ function getOidcConfig(authMode) {
       process.env.OIDC_SESSION_COOKIE_NAME || "bull_board_oidc_session",
     sessionMaxAgeSeconds: parsePositiveInteger(
       process.env.OIDC_SESSION_MAX_AGE_SECONDS,
-      86400
+      604800
     ),
     cookieSecure: parseCookieSecure(process.env.OIDC_COOKIE_SECURE),
     cookieSameSite: process.env.OIDC_COOKIE_SAME_SITE || "lax",
@@ -351,10 +453,14 @@ function getOidcConfig(authMode) {
 function getBullBoardAuthMode() {
   const authMode = (process.env.BULL_BOARD_AUTH || "").toLowerCase();
   const resolvedMode =
-    authMode || (hasOidcEnvironmentConfig() ? "oidc" : "basic");
+    authMode || (hasOidcEnvironmentConfig() ? "oidc" : "jwt");
 
-  if (!["basic", "oidc"].includes(resolvedMode)) {
-    throw new Error("BULL_BOARD_AUTH must be either basic or oidc.");
+  if (resolvedMode === "basic") {
+    return "jwt";
+  }
+
+  if (!["jwt", "oidc"].includes(resolvedMode)) {
+    throw new Error("BULL_BOARD_AUTH must be jwt, basic, or oidc.");
   }
 
   return resolvedMode;
@@ -436,10 +542,26 @@ function parseBoolean(value, fallback) {
   return value.toLowerCase() === "true";
 }
 
+function isJwtAuthRoute(request, config) {
+  const pathname = getRequestPathname(request);
+  return [config.loginPath, config.logoutPath].includes(pathname);
+}
+
 function isOidcAuthRoute(request, config) {
   const pathname = getRequestPathname(request);
   return [config.loginPath, config.callbackPath, config.logoutPath].includes(
     pathname
+  );
+}
+
+function shouldRedirectToJwtLogin(request) {
+  const accept = request.headers.accept || "";
+  const pathname = getRequestPathname(request);
+
+  return (
+    request.method === "GET" &&
+    accept.includes("text/html") &&
+    !pathname.startsWith(`${bullBoardPath}/api/`)
   );
 }
 
@@ -521,6 +643,251 @@ function getOidcSessionCookieOptions(config) {
     signed: true,
     maxAge: config.sessionMaxAgeSeconds,
   };
+}
+
+function getLoginCredentials(body) {
+  if (!body || typeof body !== "object") {
+    return null;
+  }
+
+  return {
+    username: typeof body.username === "string" ? body.username : "",
+    password: typeof body.password === "string" ? body.password : "",
+  };
+}
+
+function areJwtCredentialsValid(credentials, config) {
+  return (
+    credentials &&
+    safeEqual(credentials.username, config.username) &&
+    safeEqual(credentials.password, config.password)
+  );
+}
+
+function setJwtSessionCookie(reply, config) {
+  const now = Math.floor(Date.now() / 1000);
+  const token = createJwt(
+    {
+      sub: config.username,
+      iat: now,
+      exp: now + config.sessionMaxAgeSeconds,
+    },
+    config.secret
+  );
+
+  reply.setCookie(config.cookieName, token, getJwtSessionCookieOptions(config));
+}
+
+function clearJwtSessionCookie(reply, config) {
+  reply.clearCookie(config.cookieName, {
+    path: bullBoardPath,
+  });
+}
+
+function getJwtSession(request, config) {
+  const token = request.cookies?.[config.cookieName];
+  if (!token) {
+    return null;
+  }
+
+  const payload = verifyJwt(token, config.secret);
+  if (!payload || payload.sub !== config.username) {
+    return null;
+  }
+
+  return payload;
+}
+
+function getJwtSessionCookieOptions(config) {
+  return {
+    path: bullBoardPath,
+    httpOnly: true,
+    sameSite: config.cookieSameSite,
+    secure: config.cookieSecure,
+    maxAge: config.sessionMaxAgeSeconds,
+  };
+}
+
+function createJwt(payload, secret) {
+  const header = {
+    alg: "HS256",
+    typ: "JWT",
+  };
+  const encodedHeader = base64UrlEncodeJson(header);
+  const encodedPayload = base64UrlEncodeJson(payload);
+  const signingInput = `${encodedHeader}.${encodedPayload}`;
+  const signature = signJwtInput(signingInput, secret);
+
+  return `${signingInput}.${signature}`;
+}
+
+function verifyJwt(token, secret) {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  const [encodedHeader, encodedPayload, signature] = parts;
+  const signingInput = `${encodedHeader}.${encodedPayload}`;
+  const expectedSignature = signJwtInput(signingInput, secret);
+  if (!safeEqual(signature, expectedSignature)) {
+    return null;
+  }
+
+  try {
+    const header = JSON.parse(
+      Buffer.from(encodedHeader, "base64url").toString("utf8")
+    );
+    const payload = JSON.parse(
+      Buffer.from(encodedPayload, "base64url").toString("utf8")
+    );
+
+    if (header.alg !== "HS256" || header.typ !== "JWT") {
+      return null;
+    }
+
+    if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+
+    return payload;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function base64UrlEncodeJson(value) {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function signJwtInput(signingInput, secret) {
+  return createHmac("sha256", secret).update(signingInput).digest("base64url");
+}
+
+function renderJwtLoginPage(config, options = {}) {
+  const username = escapeHtml(options.username || "");
+  const errorMarkup = options.error
+    ? '<p class="error" role="alert">用户名或密码错误</p>'
+    : "";
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Export Queue Admin</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f4f6f8;
+      color: #1f2933;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(100% - 32px, 360px);
+      padding: 28px;
+      background: #ffffff;
+      border: 1px solid #d8dee4;
+      border-radius: 8px;
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+    }
+
+    h1 {
+      margin: 0 0 24px;
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    label {
+      display: block;
+      margin: 14px 0 6px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    input {
+      width: 100%;
+      height: 42px;
+      padding: 0 12px;
+      border: 1px solid #b8c1cc;
+      border-radius: 6px;
+      font: inherit;
+      background: #ffffff;
+    }
+
+    input:focus {
+      outline: 2px solid #2563eb;
+      outline-offset: 2px;
+      border-color: #2563eb;
+    }
+
+    button {
+      width: 100%;
+      height: 42px;
+      margin-top: 22px;
+      border: 0;
+      border-radius: 6px;
+      background: #2563eb;
+      color: #ffffff;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button:focus {
+      outline: 2px solid #1e40af;
+      outline-offset: 2px;
+    }
+
+    .error {
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: #fff1f2;
+      color: #be123c;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Export Queue Admin</h1>
+    ${errorMarkup}
+    <form method="post" action="${escapeHtml(config.loginPath)}">
+      <label for="username">用户名</label>
+      <input id="username" name="username" autocomplete="username" value="${username}" required autofocus>
+      <label for="password">密码</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">登录</button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => {
+    const entities = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+
+    return entities[char];
+  });
 }
 
 function isOidcUserAllowed(userinfo, config) {
@@ -620,23 +987,6 @@ function getRequestPathname(request) {
   return new URL(request.url, "http://localhost").pathname;
 }
 
-function isAuthorizedNotifyRequest(request) {
-  if (!notifyToken) {
-    return false;
-  }
-
-  const authorization = request.headers.authorization || "";
-  const bearerToken = authorization.startsWith("Bearer ")
-    ? authorization.slice("Bearer ".length)
-    : undefined;
-  const requestToken =
-    request.headers["x-notify-token"] || request.query.token || bearerToken;
-
-  return (
-    typeof requestToken === "string" && safeEqual(requestToken, notifyToken)
-  );
-}
-
 function getFeishuWebhookUrl(link) {
   if (typeof link !== "string" || !link) {
     return null;
@@ -661,28 +1011,6 @@ function getFeishuWebhookUrl(link) {
   }
 
   return parsedUrl.toString();
-}
-
-function parseBasicAuth(authorization) {
-  if (!authorization) {
-    return null;
-  }
-
-  const [scheme, encoded] = authorization.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    return null;
-  }
-
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const separatorIndex = decoded.indexOf(":");
-  if (separatorIndex === -1) {
-    return null;
-  }
-
-  return {
-    username: decoded.slice(0, separatorIndex),
-    password: decoded.slice(separatorIndex + 1),
-  };
 }
 
 function safeEqual(actual, expected) {
