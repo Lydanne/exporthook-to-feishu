@@ -30,8 +30,8 @@ if (notifyToken && notifyToken.length < 16) {
   throw new Error("FEISHU_NOTIFY_TOKEN must be at least 16 characters.");
 }
 
-const oidcConfig = getOidcConfig();
-const bullBoardAuthMode = getBullBoardAuthMode(oidcConfig);
+const bullBoardAuthMode = getBullBoardAuthMode();
+const oidcConfig = getOidcConfig(bullBoardAuthMode);
 
 if (bullBoardAuthMode === "oidc") {
   setupOidcAuth(oidcConfig);
@@ -244,7 +244,7 @@ function authenticateWithOidc(request, reply, config) {
   return reply.code(401).send("Authentication required.");
 }
 
-function getOidcConfig() {
+function getOidcConfig(authMode) {
   const issuer = process.env.OIDC_ISSUER;
   const clientId = process.env.OIDC_CLIENT_ID;
   const clientSecret = process.env.OIDC_CLIENT_SECRET;
@@ -268,9 +268,21 @@ function getOidcConfig() {
     issuer && clientId && clientSecret && sessionSecret
   );
 
+  if (authMode !== "oidc") {
+    return {
+      enabled: false,
+    };
+  }
+
   if (hasAnyConfig && !hasRequiredConfig) {
     throw new Error(
       "OIDC is partially configured. Set OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_SESSION_SECRET."
+    );
+  }
+
+  if (!hasRequiredConfig) {
+    throw new Error(
+      "BULL_BOARD_AUTH=oidc requires OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_SESSION_SECRET."
     );
   }
 
@@ -336,21 +348,25 @@ function getOidcConfig() {
   };
 }
 
-function getBullBoardAuthMode(config) {
+function getBullBoardAuthMode() {
   const authMode = (process.env.BULL_BOARD_AUTH || "").toLowerCase();
-  const resolvedMode = authMode || (config.enabled ? "oidc" : "basic");
+  const resolvedMode =
+    authMode || (hasOidcEnvironmentConfig() ? "oidc" : "basic");
 
   if (!["basic", "oidc"].includes(resolvedMode)) {
     throw new Error("BULL_BOARD_AUTH must be either basic or oidc.");
   }
 
-  if (resolvedMode === "oidc" && !config.enabled) {
-    throw new Error(
-      "BULL_BOARD_AUTH=oidc requires OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, and OIDC_SESSION_SECRET."
-    );
-  }
-
   return resolvedMode;
+}
+
+function hasOidcEnvironmentConfig() {
+  return [
+    process.env.OIDC_ISSUER,
+    process.env.OIDC_CLIENT_ID,
+    process.env.OIDC_CLIENT_SECRET,
+    process.env.OIDC_SESSION_SECRET,
+  ].some(Boolean);
 }
 
 function getOidcCallbackUrl(request, config) {

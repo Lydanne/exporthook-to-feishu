@@ -12,8 +12,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@bull-board/api": "^8.1.0",
-    "@bull-board/fastify": "^8.1.0",
+    "@bull-board/api": "^8.0.2",
+    "@bull-board/fastify": "^8.0.2",
     "@fastify/cookie": "^11.0.2",
     "@fastify/oauth2": "^8.2.0",
     "axios": "^1.18.1",

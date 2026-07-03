@@ -107,6 +107,7 @@ BULL_BOARD_PASSWORD=replace-with-strong-password
 ## OIDC 模式
 
 启用 OIDC 后，`BULL_BOARD_USERNAME` 和 `BULL_BOARD_PASSWORD` 会被忽略。
+如果使用 Basic Auth，保持 `.env.example` 中的 OIDC 变量为注释状态即可。
 
 ```env
 BULL_BOARD_AUTH=oidc
