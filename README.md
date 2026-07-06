@@ -80,6 +80,20 @@ REDIS_URL=redis://127.0.0.1:6379/0
 BULL_BOARD_QUEUES=export-jobs,mail-jobs,report-jobs
 ```
 
+如果生产者使用了 BullMQ Redis key prefix，需要配置相同 prefix。比如 Redis key 是
+`{export}:excel-export:wait`，队列名是 `excel-export`，prefix 是 `{export}`：
+
+```env
+BULL_BOARD_QUEUES=excel-export,pack-dir-tree,sign-synthesis
+BULL_BOARD_PREFIX={export}
+```
+
+也可以在 `BULL_BOARD_QUEUES` 里给每个队列单独指定 prefix，适合同时查看多组 prefix：
+
+```env
+BULL_BOARD_QUEUES={export}:excel-export,{export}:pack-dir-tree,{export}:sign-synthesis,{pdfgen}:pdf-export
+```
+
 ## JWT 密码登录模式
 
 适合内网或临时部署。访问 `/admin/queues` 时会先跳转到登录页，登录成功后写入 7 天有效期的 HttpOnly JWT cookie。
@@ -171,7 +185,8 @@ OIDC_REQUIRE_EMAIL_VERIFIED=false
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | 允许转发的飞书 webhook 域名 |
 | `BULL_BOARD_AUTH` | 管理页认证模式：`jwt` 或 `oidc`，`basic` 为兼容别名 |
 | `BULL_BOARD_PATH` | 管理页路径，不能是 `/` |
-| `BULL_BOARD_QUEUES` | BullMQ 队列名，逗号分隔 |
+| `BULL_BOARD_QUEUES` | BullMQ 队列名，逗号分隔；可用 `prefix:queue` 给单个队列指定 Redis key prefix |
+| `BULL_BOARD_PREFIX` | BullMQ Redis key prefix，未配置时使用 BullMQ 默认 `bull` |
 | `BULL_BOARD_USERNAME` | JWT 密码登录用户名 |
 | `BULL_BOARD_PASSWORD` | JWT 密码登录密码 |
 | `BULL_BOARD_JWT_SECRET` | JWT 签名密钥，至少 32 字符 |

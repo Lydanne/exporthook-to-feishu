@@ -82,16 +82,17 @@ fastify.addHook("onClose", async () => {
 });
 
 function setupBullBoard() {
-  const queueNames = parseList(process.env.BULL_BOARD_QUEUES);
+  const queueConfigs = getBullBoardQueueConfigs();
   const redisConnectionOptions = getRedisConnectionOptions();
   const queueErrorLogInterval = Number(
     process.env.BULL_BOARD_QUEUE_ERROR_LOG_INTERVAL_MS || 60000
   );
   const serverAdapter = new FastifyAdapter();
-  const adapters = queueNames.map((queueName) => {
+  const adapters = queueConfigs.map((queueConfig) => {
     let lastQueueErrorLoggedAt = 0;
-    const queue = new Queue(queueName, {
+    const queue = new Queue(queueConfig.name, {
       connection: redisConnectionOptions,
+      ...(queueConfig.prefix ? { prefix: queueConfig.prefix } : {}),
     });
     queue.on("error", (err) => {
       const now = Date.now();
@@ -100,10 +101,15 @@ function setupBullBoard() {
       }
 
       lastQueueErrorLoggedAt = now;
-      fastify.log.warn({ err, queue: queueName }, "Bull Board queue error");
+      fastify.log.warn(
+        { err, queue: queueConfig.name, prefix: queueConfig.prefix },
+        "Bull Board queue error"
+      );
     });
     bullBoardQueues.push(queue);
-    return new BullMQAdapter(queue);
+    return new BullMQAdapter(queue, {
+      prefix: queueConfig.prefix ? `${queueConfig.prefix}:` : undefined,
+    });
   });
 
   serverAdapter.setBasePath(bullBoardPath);
@@ -131,6 +137,36 @@ function setupBullBoard() {
   });
 
   fastify.register(serverAdapter.registerPlugin(), { prefix: bullBoardPath });
+}
+
+function getBullBoardQueueConfigs() {
+  const defaultPrefix = (process.env.BULL_BOARD_PREFIX || "").trim();
+
+  return parseList(process.env.BULL_BOARD_QUEUES).map((queueRef) => {
+    const parsedQueueRef = parseBullBoardQueueRef(queueRef);
+
+    return {
+      name: parsedQueueRef.name,
+      prefix: parsedQueueRef.prefix || defaultPrefix || undefined,
+    };
+  });
+}
+
+function parseBullBoardQueueRef(queueRef) {
+  const separatorIndex = queueRef.indexOf(":");
+  if (separatorIndex === -1) {
+    return { name: queueRef };
+  }
+
+  const prefix = queueRef.slice(0, separatorIndex).trim();
+  const name = queueRef.slice(separatorIndex + 1).trim();
+  if (!prefix || !name) {
+    throw new Error(
+      `Invalid BULL_BOARD_QUEUES item "${queueRef}". Use "queue" or "prefix:queue".`
+    );
+  }
+
+  return { name, prefix };
 }
 
 function setupJwtAuth(config) {
