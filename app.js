@@ -24,6 +24,9 @@ const feishuWebhookAllowedHosts = parseList(
   process.env.FEISHU_WEBHOOK_ALLOWED_HOSTS ||
     "open.feishu.cn,open.larksuite.com"
 ).map((host) => host.toLowerCase());
+const publicBaseUrl = normalizeBaseUrl(
+  process.env.BASE_URL || "http://120.53.222.157:9001"
+);
 
 const bullBoardAuthMode = getBullBoardAuthMode();
 const jwtAuthConfig = getJwtAuthConfig(bullBoardAuthMode);
@@ -38,7 +41,7 @@ if (bullBoardAuthMode === "oidc") {
 setupBullBoard();
 
 // Declare a route
-fastify.post("/notify/feishu", async (request, reply) => {
+fastify.post("/webhook/feishu", async (request, reply) => {
   const link = getFeishuWebhookUrl(request.query.link);
   if (!link) {
     return reply.code(400).send("Invalid Feishu webhook URL.");
@@ -46,25 +49,16 @@ fastify.post("/notify/feishu", async (request, reply) => {
 
   const { jobQueue, jobId, status, result, error, cost, startAt, payload } =
     request.body;
-
-  let message = `# 导出完成\n队列名称：${jobQueue}\n任务编号：${jobId}\n创建时间：${new Date(
-    startAt
-  ).toLocaleString()}\n花费时间：${cost / 1000}s`;
-  const code = result.code || 0;
-  if (status === "completed" && code === 0) {
-    message += `
-文件名称：${basename(decodeURIComponent(result.url))}
-导出状态：成功
-文件链接：${result.url}
-文件大小：${result.size / 1024 / 1024}MB
-文件数量：${result.count}`;
-  } else {
-    message += `
-导出状态：失败(status: ${status}, code: ${code})
-错误信息：${error === "null" ? result.msg : error}`;
-  }
-
-  message += `\n用户Openid: ${payload.openid}\n\n[查看详情](http://120.53.222.157:9001/xgj-export-test/${jobQueue}/${jobId})`;
+  const message = buildFeishuMessage({
+    jobQueue,
+    jobId,
+    status,
+    result,
+    error,
+    cost,
+    startAt,
+    payload,
+  });
 
   const res = await axios.post(link, {
     msg_type: "text", // 指定消息类型
@@ -167,6 +161,57 @@ function parseBullBoardQueueRef(queueRef) {
   }
 
   return { name, prefix };
+}
+
+function buildFeishuMessage({
+  jobQueue,
+  jobId,
+  status,
+  result,
+  error,
+  cost,
+  startAt,
+  payload,
+}) {
+  const code = Number(result?.code || 0);
+  const isSuccess = status === "completed" && code === 0;
+  const lines = [
+    "# 导出任务通知",
+    "",
+    `状态：${isSuccess ? "成功" : "失败"}`,
+    `队列：${formatValue(jobQueue)}`,
+    `任务：${formatValue(jobId)}`,
+    `创建时间：${formatDate(startAt)}`,
+    `耗时：${formatSeconds(cost)}`,
+    `用户 OpenID：${formatValue(payload?.openid)}`,
+  ];
+
+  if (isSuccess) {
+    lines.push(
+      "",
+      "导出结果：",
+      `文件名称：${getResultFileName(result?.url)}`,
+      `文件数量：${formatValue(result?.count)}`,
+      `文件大小：${formatFileSize(result?.size)}`,
+      `文件链接：${formatValue(result?.url)}`
+    );
+  } else {
+    lines.push(
+      "",
+      "失败信息：",
+      `状态码：${formatValue(status)} / ${formatValue(code)}`,
+      `错误信息：${formatValue(getFailureMessage(error, result))}`
+    );
+  }
+
+  lines.push(
+    "",
+    "操作入口：",
+    `当前任务状态：${getBullBoardJobUrl(jobQueue, jobId)}`,
+    `当前队列状态：${getBullBoardQueueUrl(jobQueue)}`
+  );
+
+  return lines.join("\n");
 }
 
 function setupJwtAuth(config) {
@@ -958,6 +1003,124 @@ function getClaim(userinfo, claimName) {
 function normalizePath(path) {
   const normalized = path.startsWith("/") ? path : `/${path}`;
   return normalized.replace(/\/+$/, "") || "/";
+}
+
+function normalizeBaseUrl(value) {
+  const baseUrl = String(value || "").trim();
+  if (!baseUrl) {
+    throw new Error("BASE_URL must not be empty.");
+  }
+
+  const normalizedBaseUrl = /^https?:\/\//i.test(baseUrl)
+    ? baseUrl
+    : `https://${baseUrl}`;
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(normalizedBaseUrl);
+  } catch (_err) {
+    throw new Error("BASE_URL must be a valid http(s) URL.");
+  }
+
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    throw new Error("BASE_URL must use http or https.");
+  }
+
+  parsedUrl.search = "";
+  parsedUrl.hash = "";
+
+  return parsedUrl.toString().replace(/\/+$/, "");
+}
+
+function getBullBoardQueueUrl(jobQueue) {
+  return `${publicBaseUrl}${bullBoardPath}/queue/${encodeURIComponent(
+    getBullBoardQueueRouteName(jobQueue)
+  )}`;
+}
+
+function getBullBoardJobUrl(jobQueue, jobId) {
+  return `${getBullBoardQueueUrl(jobQueue)}/${encodeURIComponent(
+    String(jobId)
+  )}`;
+}
+
+function getBullBoardQueueRouteName(jobQueue) {
+  const queueName = String(jobQueue || "");
+  const queueConfigs = getBullBoardQueueConfigs();
+  const exactMatch = queueConfigs.find(
+    (queueConfig) => getQueueDisplayName(queueConfig) === queueName
+  );
+  if (exactMatch) {
+    return getQueueDisplayName(exactMatch);
+  }
+
+  const nameMatch = queueConfigs.find(
+    (queueConfig) => queueConfig.name === queueName
+  );
+  if (nameMatch) {
+    return getQueueDisplayName(nameMatch);
+  }
+
+  return queueName;
+}
+
+function getQueueDisplayName(queueConfig) {
+  return queueConfig.prefix
+    ? `${queueConfig.prefix}:${queueConfig.name}`
+    : queueConfig.name;
+}
+
+function getResultFileName(url) {
+  if (!url) {
+    return "-";
+  }
+
+  try {
+    return basename(decodeURIComponent(new URL(url).pathname));
+  } catch (_err) {
+    return basename(String(url));
+  }
+}
+
+function getFailureMessage(error, result) {
+  if (error && error !== "null") {
+    return error;
+  }
+
+  return result?.msg;
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+
+  return date.toLocaleString();
+}
+
+function formatSeconds(value) {
+  const seconds = Number(value) / 1000;
+  if (!Number.isFinite(seconds)) {
+    return "-";
+  }
+
+  return `${seconds.toFixed(2)}s`;
+}
+
+function formatFileSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size)) {
+    return "-";
+  }
+
+  return `${(size / 1024 / 1024).toFixed(2)}MB`;
+}
+
+function formatValue(value) {
+  return value === undefined || value === null || value === ""
+    ? "-"
+    : String(value);
 }
 
 function normalizeBullBoardPath(path) {

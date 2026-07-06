@@ -29,10 +29,23 @@ FEISHU_WEBHOOK_ALLOWED_HOSTS=open.feishu.cn,open.larksuite.com
 接口：
 
 ```http
-POST /notify/feishu?link=open.feishu.cn/open-apis/bot/v2/hook/<token>
+POST /webhook/feishu?link=open.feishu.cn/open-apis/bot/v2/hook/<token>
 ```
 
 服务会把 `link` 转成 HTTPS URL，并只允许发送到 `FEISHU_WEBHOOK_ALLOWED_HOSTS` 中的域名。
+
+飞书消息底部会使用 `BASE_URL` 拼接当前系统的 Bull Board 状态入口：
+
+```env
+BASE_URL=https://export.example.com
+```
+
+生成的链接格式：
+
+```text
+https://export.example.com/admin/queues/queue/<queueName>/<jobId>
+https://export.example.com/admin/queues/queue/<queueName>
+```
 
 请求体需要包含当前代码使用的字段：
 
@@ -183,6 +196,7 @@ OIDC_REQUIRE_EMAIL_VERIFIED=false
 | --- | --- |
 | `PORT` | 服务监听端口，默认 `8001` |
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | 允许转发的飞书 webhook 域名 |
+| `BASE_URL` | 当前系统对外访问地址，用于生成飞书消息里的 Bull Board 状态入口，默认 `http://120.53.222.157:9001` |
 | `BULL_BOARD_AUTH` | 管理页认证模式：`jwt` 或 `oidc`，`basic` 为兼容别名 |
 | `BULL_BOARD_PATH` | 管理页路径，不能是 `/` |
 | `BULL_BOARD_QUEUES` | BullMQ 队列名，逗号分隔；可用 `prefix:queue` 给单个队列指定 Redis key prefix |
