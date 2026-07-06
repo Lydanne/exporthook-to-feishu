@@ -1225,7 +1225,10 @@ function safeEqual(actual, expected) {
 // Run the server!
 const start = async () => {
   try {
-    await fastify.listen({ port: Number(process.env.PORT || 8001) });
+    await fastify.listen({
+      host: process.env.HOST || "0.0.0.0",
+      port: Number(process.env.PORT || 8001),
+    });
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

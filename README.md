@@ -12,7 +12,7 @@ pnpm install --frozen-lockfile
 pnpm start
 ```
 
-默认监听 `PORT=8001`。首次部署前建议从 `.env.example` 复制一份 `.env`，并替换所有密钥类配置。
+默认监听 `HOST=0.0.0.0`、`PORT=8001`。首次部署前建议从 `.env.example` 复制一份 `.env`，并替换所有密钥类配置。
 
 ## 必填安全配置
 
@@ -195,6 +195,7 @@ OIDC_REQUIRE_EMAIL_VERIFIED=false
 | 变量 | 说明 |
 | --- | --- |
 | `PORT` | 服务监听端口，默认 `8001` |
+| `HOST` | 服务监听地址，默认 `0.0.0.0`；如只允许本机访问可设为 `127.0.0.1` |
 | `FEISHU_WEBHOOK_ALLOWED_HOSTS` | 允许转发的飞书 webhook 域名 |
 | `BASE_URL` | 当前系统对外访问地址，用于生成飞书消息里的 Bull Board 状态入口，默认 `http://120.53.222.157:9001` |
 | `BULL_BOARD_AUTH` | 管理页认证模式：`jwt` 或 `oidc`，`basic` 为兼容别名 |
